@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
 
-REPO_URL="${REPO_URL:-https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold}"
+REPO_URL="${REPO_URL:-https://github.com/nathjw/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold}"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing, run scripts/prepare.sh first"
 hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE")
 [[ "$hash" == "$(image_hash)" ]] ||

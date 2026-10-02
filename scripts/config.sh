@@ -39,25 +39,32 @@ MODEL_ID="${MODEL_ID:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"   # EXL3 routed ex
 _rev=""; [[ "$MODEL_ID" == Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw ]] && _rev=9eaebb7c4e96d983dcd538e18624622ba5b820a8
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
 TF_VERSION="${TF_VERSION:-v0.6.0}"
-TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
-IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
+TF_REPO="${TF_REPO:-https://github.com/nathjw/TensorFold.git}"
+# Independent of the upstream release: an immutable commit of the generic allocator backport.
+TF_REF="${TF_REF:-b59a5e9fdb2439b0d748c67225d6edadecd0650a}"
+[[ "$TF_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'TF_REF must be an exact 40-character commit' >&2; exit 1; }
+# Reuse the exact released runtime/toolchain layers; reinstall TF from TF_REF before applying all patches.
+BASE_IMAGE="${BASE_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold@sha256:22789f0cb3dc308f0b2ce52a33961b88bd624af1725e91e8aba0a74a671bb969}"
+IMAGE="${IMAGE:-tensorfold-glm53-display:${TF_VERSION}}"
 # pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs);
 # they are part of the image's hash, so a change rebuilds it like a patch does
 IMAGE_EXTRAS="av==18.1.0 xgrammar>=0.2.8,<0.3"
-image_hash() { (cat patches/*.patch 2>/dev/null; echo "$IMAGE_EXTRAS") | sha256sum | cut -c1-12; }
-GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold}"
+image_hash() {
+  (cat patches/*.patch scripts/build-image.sh; printf '%s\n' "$IMAGE_EXTRAS" "$TF_VERSION" "$TF_REPO" "$TF_REF" "$BASE_IMAGE") |
+    sha256sum | cut -c1-12
+}
+GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/nathjw/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold}"
 # The published image of this release's patches, pinned: prepare.sh pulls it by digest (a tag can be moved, a digest
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-ae8d1c789b47}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:22789f0cb3dc308f0b2ce52a33961b88bd624af1725e91e8aba0a74a671bb969}"
+IMAGE_TAG="${IMAGE_TAG:-}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
 }
-CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf}"           # the same name on both Sparks
+CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf-display}"   # isolated from the baseline on both Sparks
 
 SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash-EXL3}"
 HOST="${HOST:-0.0.0.0}"
@@ -83,6 +90,15 @@ PARALLEL="${PARALLEL:-$_par}"
 # ones. bf16: the exact cache (~196k tokens with DFlash2).
 KV="${KV:-fp8}"
 export TF_GLM_KV="$KV"
+# Experiment only. PLANE is the zero-based model layer, not the DSA ordinal; layer 3 is the first DSA.
+DISPLAY_KV="${DISPLAY_KV:-0}"
+DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-1792}"
+DISPLAY_KV_PLANE="${DISPLAY_KV_PLANE:-}"
+DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-/dev/dri/card0}"
+KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"  # zero: auto; otherwise exact shared pool, also with DISPLAY_KV=0
+export TF_GLM_DISPLAY_KV="$DISPLAY_KV" TF_GLM_DISPLAY_KV_MIB="$DISPLAY_KV_MIB"
+export TF_GLM_DISPLAY_KV_PLANE="$DISPLAY_KV_PLANE" TF_GLM_DISPLAY_KV_CARD="$DISPLAY_KV_CARD"
+export TF_GLM_KV_POOL_TOKENS="$KV_POOL_TOKENS"
 # Prompt + reply window. With KV=fp8: 1,048,576 (the checkpoint's native window). With KV=bf16: 196,608 with DFlash2
 # (163,840 with VISION=1 and DENSE=fp8 or bf16: the tower costs rank 0 ~66k tokens of window, which q4's smaller
 # weights give back), 524,288 with mtp. start.sh falls back to the largest that fits when a start's memory budget is
@@ -199,7 +215,7 @@ NFS_PATH="${NFS_PATH:-$HF_CACHE}"
 NFS_SERVER="${NFS_SERVER:-}"
 NFS_VOLUME="${NFS_VOLUME:-glm53-hf}"
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-glm53}"   # compiled CUDA kernels, a folder per image's patches hash
-STATE_DIR="${STATE_DIR:-$HOME/.local/state/glm53-tensorfold}"   # this recipe's locks and setup marker
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/glm53-tensorfold-display}"   # separate locks and setup marker
 # Free disk prepare.sh asks for before it downloads or copies: the checkpoint (~176 GB) under HF_CACHE (on the worker,
 # the copy is checked against its size instead), and an image build or copy (~25 GB) under Docker's root on each Spark;
 # both together when they share a filesystem.

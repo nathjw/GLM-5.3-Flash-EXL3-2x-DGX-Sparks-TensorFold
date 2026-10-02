@@ -164,6 +164,7 @@ SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the 
 
 # ---------------------------------------------------------------- 2. checks
 step 2 "Checks: arguments, link, previous server, port, memory"
+[[ "$DISPLAY_KV" == 0 ]] || ./scripts/display-kv-preflight.sh
 # tensorfold's own parser, in a throwaway container without the GPU: a typo fails here, before anything is stopped
 docker run --rm --entrypoint python "$IMAGE" -c \
   'import sys; from tensorfold.cli import build_parser; build_parser().parse_args(sys.argv[1:])' \
@@ -210,6 +211,7 @@ ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
 while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' || true)
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
           --ulimit memlock=-1 --ulimit stack=67108864)
+[[ "$DISPLAY_KV" == 0 ]] || RUN_ARGS+=(--device "$DISPLAY_KV_CARD")
 
 # ---------------------------------------------------------------- 3. launch, 4. load (a second try when the window does not fit)
 # No token goes into the containers: the ranks read only the local cache (HF_HUB_OFFLINE=1), and with HF_HUB_OFFLINE=0

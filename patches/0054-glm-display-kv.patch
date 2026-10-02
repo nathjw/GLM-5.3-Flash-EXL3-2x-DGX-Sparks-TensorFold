@@ -1,0 +1,334 @@
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/display_kv.py
+@@ -0,0 +1,111 @@
++"""Recipe policy for one complete FP8 latent plane in external display storage.
++
++The generic DRM/CUDA allocator lives in tensorfold.cuda.display_memory. All GLM
++layout, layer selection and pool sizing policy stays in this recipe patch.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++import os
++
++ALIGN = 2048
++DRM_ALIGNMENT = 65536
++
++
++@dataclass(frozen=True)
++class Settings:
++    enabled: bool = False
++    layer: int = -1
++    max_bytes: int = 1792 << 20
++    card: str = '/dev/dri/card0'
++    pool_tokens: int = 0
++
++    @classmethod
++    def from_env(cls, env=None):
++        env = os.environ if env is None else env
++        on = env.get('TF_GLM_DISPLAY_KV', '0')
++        if on not in ('0', '1'):
++            raise ValueError('TF_GLM_DISPLAY_KV must be 0 or 1')
++        pool = int(env.get('TF_GLM_KV_POOL_TOKENS', '0'))
++        if pool < 0 or pool % ALIGN:
++            raise ValueError('TF_GLM_KV_POOL_TOKENS must be zero (auto) or a positive multiple of 2048')
++        if on == '0':
++            return cls(pool_tokens=pool)
++        layer = int(env.get('TF_GLM_DISPLAY_KV_PLANE', '-1'))
++        mib = int(env.get('TF_GLM_DISPLAY_KV_MIB', '1792'))
++        card = env.get('TF_GLM_DISPLAY_KV_CARD', '/dev/dri/card0')
++        if layer < 0:
++            raise ValueError('set TF_GLM_DISPLAY_KV_PLANE to the zero-based model layer (e.g. 3), not DSA ordinal')
++        if not 1 <= mib <= 1792:
++            raise ValueError('TF_GLM_DISPLAY_KV_MIB must be between 1 and the qualified ceiling of 1792')
++        if not card.startswith('/dev/dri/card') or not card[len('/dev/dri/card'):].isdigit():
++            raise ValueError('TF_GLM_DISPLAY_KV_CARD must be /dev/dri/cardN')
++        return cls(True, layer, mib << 20, card, pool)
++
++    def validate(self, cfg, *, parallel, latent, kv):
++        if (self.enabled or self.pool_tokens) and parallel < 2:
++            raise ValueError('Display-KV and fixed pool sizing require --parallel 2..4 (one request still works)')
++        if not self.enabled:
++            return
++        if not latent or kv != 'fp8':
++            raise ValueError('Display-KV currently requires TF_GLM_LATENT=1 and TF_GLM_KV=fp8')
++        if self.layer >= len(cfg.kinds) or cfg.kinds[self.layer] != 'dsa':
++            raise ValueError(f'Display-KV layer {self.layer} is not a DSA layer')
++        if cfg.kv_lora % 16:
++            raise ValueError('Display-KV needs a latent width divisible by 16')
++
++    def code(self):
++        # Card paths may differ between hosts. Placement, size and pool must agree on both ranks.
++        return [int(self.enabled), self.layer, self.max_bytes >> 20, self.pool_tokens]
++
++    def row_bytes(self, width):
++        return width + 16 if self.enabled else 0
++
++    def max_rows(self, width):
++        return self.max_bytes // (width + 16) // ALIGN * ALIGN
++
++    def offloaded(self, rows, width):
++        # Clamped for the capacity estimator's probes; actual allocation requires the WHOLE plane.
++        return min(rows, self.max_rows(width)) * self.row_bytes(width)
++
++    def allocate(self, rows, width, device='cuda'):
++        if not self.enabled:
++            return None
++        from tensorfold.cuda.display_memory import zeros
++        import torch
++
++        if rows > self.max_rows(width):
++            raise ValueError(f'Display-KV plane needs {rows * (width + 16)} bytes, ceiling {self.max_bytes}')
++        storage = zeros((rows, width + 16), dtype=torch.uint8, device=device, card=self.card, max_bytes=self.max_bytes)
++        storage.receipt['layer'] = self.layer
++        return storage
++
++
++def pool_rows(settings, *, capacity, automatic, width, growth_bytes, allowance):
++    """Choose a whole pool that fits BOTH ordinary memory and one complete external plane.
++
++    ``growth_bytes(rows)`` includes fixed retained states and every cache/workspace change
++    from the startup context. A forced pool never silently shrinks or exceeds its budget.
++    """
++    minimum = (capacity + ALIGN - 1) // ALIGN * ALIGN
++    ceiling = settings.max_rows(width) if settings.enabled else automatic
++    if settings.pool_tokens:
++        chosen = settings.pool_tokens
++        if chosen < minimum:
++            raise ValueError(f'fixed KV pool {chosen} cannot hold context plus reserve ({minimum} rows)')
++        if settings.enabled and chosen > ceiling:
++            raise ValueError(f'fixed KV pool {chosen} exceeds display plane capacity {ceiling}')
++        if growth_bytes(chosen) > allowance:
++            raise ValueError(f'fixed KV pool {chosen} needs more ordinary memory than its budget; lower pool/context')
++        return chosen
++    ceiling = min(automatic, ceiling)
++    if ceiling < minimum or growth_bytes(minimum) > allowance:
++        raise ValueError('Display-KV pool cannot hold context, reserve and retained states within both budgets')
++    lo, hi = minimum // ALIGN, ceiling // ALIGN
++    while lo < hi:
++        mid = (lo + hi + 1) // 2
++        if growth_bytes(mid * ALIGN) <= allowance:
++            lo = mid
++        else:
++            hi = mid - 1
++    return lo * ALIGN
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -457,6 +457,10 @@
+         if kv != "bf16" and not LATENT:
+             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
+         self.kv = kv
++        from .display_kv import Settings as DisplaySettings
++
++        display = DisplaySettings.from_env()
++        display.validate(cfg, parallel=parallel, latent=LATENT, kv=kv)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
+         if not self.mtp_on:
+@@ -496,9 +500,10 @@
+             # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
+             extra = workspace + (parallel - 1) * (slot_bytes(text) + mla_ring_bytes(text, prefill_rows))
+             per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
+-            if not extra and not per:
++            if not extra and not per and not display.enabled:
+                 return g
+-            return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
++            return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots
++                            - display.offloaded(slots, cfg.kv_lora), g.reserve, g.minimum_slots)
+ 
+         def draft_geometry(text):
+             from tensorfold.cuda.capacity import Geometry
+@@ -542,7 +547,7 @@
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv)]
++                                 KV_KINDS.index(kv)] + display.code()
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -554,7 +559,8 @@
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, "
++                               "TF_GLM_DISPLAY_KV*, TF_GLM_KV_POOL_TOKENS): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -575,6 +581,27 @@
+             per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+             states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, rows=0) // 2 + (22 << 20))
+             pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
++            if display.enabled or display.pool_tokens:
++                from .display_kv import pool_rows as choose_pool_rows
++
++                dg = draft_geometry(read_config(drafter)) if drafter is not None else None
++                def growth(rows):
++                    return (g.bytes_at(rows) - g.bytes_at(capacity) + states
++                            + (dg.bytes_at(rows) - dg.bytes_at(capacity) if dg else 0))
++                allowance = self.cache_bytes
++                pool_rows = choose_pool_rows(display, capacity=capacity, automatic=pool_rows, width=cfg.kv_lora,
++                                             growth_bytes=growth, allowance=allowance)
++                used = growth(pool_rows)
++                # Earlier baseline bookkeeping added the whole kept budget. Report the actual revised
++                # geometry, including retained fixed states and the offloaded plane, exactly once.
++                plan['kept_bytes'] = used
++                plan['cache_workspace_bytes_estimate'] += used
++                plan['serving_peak_bytes_estimate'] += used - allowance
++                plan['total_bytes_estimate'] = max(plan['startup_peak_bytes_estimate'],
++                                                   plan['serving_peak_bytes_estimate'])
++                plan['full_mapped_working_set_bytes_estimate'] = (plan['total_bytes_estimate']
++                                                                  + plan['mapped_table_bytes'])
++                plan['display_kv_requested_bytes'] = display.offloaded(pool_rows, cfg.kv_lora)
+             if pool_rows < ALIGN:
+                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+                                  f"extent; free memory or lower --context")
+@@ -588,6 +615,20 @@
+             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
+                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
++        self.display_storage = None
++        if display.enabled:
++            # Establish the physical backing on BOTH ranks before loading weights or capturing graphs.
++            error = None
++            try:
++                self.display_storage = display.allocate(pool_rows, cfg.kv_lora)
++            except Exception as exc:
++                error = exc
++            errors = self._gather_ints([int(error is not None)])
++            if any(row[0] for row in errors):
++                self.display_storage = None
++                raise RuntimeError(f'Display-KV allocation failed on a rank: {error or "peer failure; see peer log"}')
++            plan['display_kv'] = dict(self.display_storage.receipt)
++            print(f'[tensorfold] rank {rank} Display-KV: {plan["display_kv"]}; pool {pool_rows} tokens', flush=True)
+         w = load(model_dir, rank=rank, mtp=self.mtp_on)
+         w.comm = self.comm
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+@@ -605,7 +646,8 @@
+         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
+                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
+-                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
++                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv,
++                        display=self.display_storage)
+         if self.e.pbuf.split is not None:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -182,7 +182,7 @@
+     pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only."""
+ 
+     def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
+-                 kv: str = "bf16") -> None:
++                 kv: str = "bf16", display=None) -> None:
+         from .pool import Arena, Plane
+ 
+         c = w.cfg
+@@ -193,6 +193,21 @@
+         if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
+             raise ValueError(f"TF_GLM_KV={kv}: bf16, or fp8 with the latent cache (TF_GLM_LATENT=1)")
+         self.kv = kv
++        self.display = display  # keep the native owner for the whole cache and graph lifetime
++        display_ordinal = None
++        if display is not None:
++            indices = [l.index for l in w.layers if l.kind == "dsa"]
++            layer = display.receipt['layer']
++            if kv != 'fp8' or not self.latent or layer not in indices:
++                raise ValueError('Display-KV must select a DSA FP8 latent plane')
++            if tuple(display.tensor.shape) != (rows, c.kv_lora + kv8.PAD) or display.tensor.dtype != torch.uint8:
++                raise ValueError('Display-KV tensor does not match the complete FP8 latent plane')
++            expected_device = torch.device(dev)
++            if expected_device.index is None and expected_device.type == 'cuda':
++                expected_device = torch.device('cuda', torch.cuda.current_device())
++            if display.tensor.device != expected_device or not display.tensor.is_contiguous():
++                raise ValueError('Display-KV tensor has the wrong device or layout')
++            display_ordinal = indices.index(layer)
+         planes: list[Plane] = []
+ 
+         def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16") -> int:
+@@ -208,8 +223,12 @@
+             return add((HL, c.qk_dim)), add((HL, c.v_dim))
+ 
+         self.kc, self.vc = [], []
+-        for _ in range(dsa):
+-            k, v = attention_planes()
++        for i in range(dsa):
++            if i == display_ordinal:
++                planes.append(Plane(display.tensor))
++                k, v = len(planes) - 1, None
++            else:
++                k, v = attention_planes()
+             self.kc.append(k)
+             self.vc.append(v)
+         self.mtp = attention_planes() if w.mtp is not None else None
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -85,7 +85,7 @@
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
+-                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None) -> None:
++                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None, display=None) -> None:
+         """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
+         the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
+         anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
+@@ -130,7 +130,7 @@
+ 
+         self.caches = Caches(w, pool_rows or capacity, streams=streams,
+                              ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
+-                             kv=kv8.kv_kind() if kv is None else kv)
++                             kv=kv8.kv_kind() if kv is None else kv, display=display)
+         self.slots = Slots(w, streams, max_rows)
+         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
+         self.last_hidden: torch.Tensor | None = None
+--- tensorfold/families/glm5_next/cuda/graphs.py
++++ tensorfold/families/glm5_next/cuda/graphs.py
+@@ -39,6 +39,8 @@
+                     g = torch.cuda.CUDAGraph()
+                     with torch.cuda.graph(g, pool=self.pool):
+                         compute(w, st, e.buf, R)
++                    if e.caches.display is not None:
++                        e.caches.display.retain_graph(g)
+                     self.main[(R, parity)] = g
+             st.cur = saved
+             if w.mtp is not None:
+@@ -50,6 +52,8 @@
+                     g = torch.cuda.CUDAGraph()
+                     with torch.cuda.graph(g, pool=self.pool):
+                         mtp_compute(w, st, e.mbuf, n)
++                    if e.caches.display is not None:
++                        e.caches.display.retain_graph(g)
+                     self.mtp[n] = g
+             if st.index is not None and latent.ENABLED:
+                 self._capture_sparse(e, main_rows, mtp_rows, parities)
+@@ -69,6 +73,8 @@
+                     g = torch.cuda.CUDAGraph()
+                     with torch.cuda.graph(g, pool=self.pool):
+                         compute(w, st, e.buf, R, sparse_np=bucket)
++                    if e.caches.display is not None:
++                        e.caches.display.retain_graph(g)
+                     self.sparse[(R, parity, bucket)] = g
+             if w.mtp is not None:
+                 for n in mtp_rows:
+@@ -78,5 +84,7 @@
+                     g = torch.cuda.CUDAGraph()
+                     with torch.cuda.graph(g, pool=self.pool):
+                         mtp_compute(w, st, e.mbuf, n, sparse_np=bucket)
++                    if e.caches.display is not None:
++                        e.caches.display.retain_graph(g)
+                     self.sparse_mtp[(n, bucket)] = g
+         st.cur = saved
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -137,6 +137,8 @@
+             g = torch.cuda.CUDAGraph()
+             with torch.cuda.graph(g, pool=pool):
+                 run()
++            if e.caches.display is not None:
++                e.caches.display.retain_graph(g)
+             self.graphs[R] = g
+         torch.cuda.synchronize()
+         e.slots.rec[0].zero_()
